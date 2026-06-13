@@ -1,10 +1,6 @@
 // popup.js — pdf.js 在 popup 自身上下文中运行，不注入到任何页面
 
-const URL_REGEX =
-  /https?:\/\/(www\.)?[-a-zA-Z0-9@:%._+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b([-a-zA-Z0-9()@:%_+.~#?&/=]*)/gi;
-
 const $ = (id) => document.getElementById(id);
-
 function setContent(html) { $("content").innerHTML = html; }
 function setFilename(name) { $("header-filename").textContent = name || "未知文件"; }
 
@@ -31,81 +27,130 @@ function renderError(msg) {
   setContent(`<div class="error-box">⚠️ ${msg}</div>`);
 }
 
-// ── 智能文本拼接：处理 PDF 文本层 item 间的 URL 断行 ───────────────────────
+// ════════════════════════════════════════════════════════════════════════════
+//  URL 提取核心逻辑
 //
-// PDF 的 getTextContent() 返回若干 item，每个 item 有：
-//   - str      : 文字内容
-//   - transform: [scaleX, skewY, skewX, scaleY, x, y] 左下角坐标
-//   - width    : item 渲染宽度（字体单位）
-//   - hasEOL   : 是否行末
+//  背景：pdf.js getTextContent() 返回 items 数组，每个 item 是一小段文字。
+//  长 URL 可能被切成多个相邻 item（同行）或跨行 item。
 //
-// 问题根源：长 URL 在 PDF 排版时被拆成多个连续 item（或跨行），
-// 简单 join(" ") 会把 URL 中间插入空格导致截断。
+//  旧方案（join(" ")）的问题：
+//    ① 同行紧邻 item 插入空格 → URL 被空格截断
+//    ② 跨行续接过于激进 → 多个独立 URL 被粘连
 //
-// 修复策略：判断相邻两个 item 是否"无缝衔接"，若是则直接拼接（不加空格）：
-//   1. 同一行（y 坐标相同），且前一 item 的右边缘 ≈ 当前 item 左边缘
-//   2. 当前行首 item 的内容像是上一行末 URL 的续接
-//      （上一行末尾不含空格结尾，且当前首字符是 URL 合法字符，非大写字母开头新词）
+//  新方案：状态机，以"http(s)://"为 URL 开始标志，逐 item 追踪：
+//    - 遇到 http → 结束当前 URL，开始新 URL
+//    - 同行紧邻 → 直接追加（无空格）
+//    - 跨行且当前 URL 末尾"不完整" → 续接（去可能的断行连字符）
+//    - 跨行且当前 URL 末尾"完整"   → 结束当前 URL，忽略非 URL 行首内容
 //
-function buildSmartText(items) {
-  if (!items.length) return "";
+// ════════════════════════════════════════════════════════════════════════════
 
-  // 容差：x 坐标差值在此范围内认为"紧邻"（字体单位，约 1-2 个字符宽）
-  const X_GAP_THRESHOLD = 2;
+// 判断两个相邻 item 是否在同一行且 x 坐标紧邻
+function isAdjacentSameLine(prev, cur, threshold = 2) {
+  const sameY = Math.abs(cur.transform[5] - prev.transform[5]) < 1;
+  const prevRight = prev.transform[4] + (prev.width ?? 0);
+  const xGap = cur.transform[4] - prevRight;
+  return sameY && xGap <= threshold;
+}
 
-  let result = "";
+// 判断当前积累的 URL 末尾是否"看起来完整"（不像被截断）
+// 完整：末尾是字母/数字，且不以 "-" 结尾（连字符通常意味着断行截断）
+function urlLooksComplete(s) {
+  return /[a-zA-Z0-9]$/.test(s) && !/-$/.test(s);
+}
+
+// 把 item.str 按所有 http(s):// 位置切割成段
+// 返回：[{ isStart: bool, text: string }, ...]
+// 例："foo https://a.com bar https://b.com baz"
+//   → [{isStart:false,text:"foo "}, {isStart:true,text:"https://a.com bar "},
+//      {isStart:true,text:"https://b.com baz"}]
+// 注意：isStart=true 的 text 包含从 http 到下一个 http（或末尾）之间的所有内容
+function splitAtHttpStarts(str) {
+  const parts = [];
+  const re = /https?:\/\//gi;
+  const matches = [...str.matchAll(re)];
+
+  if (matches.length === 0) {
+    parts.push({ isStart: false, text: str });
+    return parts;
+  }
+
+  if (matches[0].index > 0) {
+    parts.push({ isStart: false, text: str.slice(0, matches[0].index) });
+  }
+
+  for (let i = 0; i < matches.length; i++) {
+    const start = matches[i].index;
+    const end   = i + 1 < matches.length ? matches[i + 1].index : str.length;
+    parts.push({ isStart: true, text: str.slice(start, end) });
+  }
+
+  return parts;
+}
+
+// 主函数：从 items 中提取所有 URL
+function extractUrlsFromItems(items) {
+  const found = [];   // 最终结果
+  let buf = null;     // 当前正在积累的 URL 字符串，null 表示不在 URL 中
+
+  function flush() {
+    if (buf !== null) {
+      // 去除末尾标点（保留字母/数字/斜杠结尾的部分）
+      const cleaned = buf.replace(/[.,;:!?)>\]»]+$/, "");
+      if (/^https?:\/\/.{4,}/.test(cleaned)) {
+        found.push(cleaned);
+      }
+      buf = null;
+    }
+  }
 
   for (let i = 0; i < items.length; i++) {
     const cur  = items[i];
     const prev = items[i - 1];
     const str  = cur.str;
+    if (!str) continue;
 
-    if (i === 0) {
-      result += str;
-      continue;
-    }
+    const adjacent = prev && isAdjacentSameLine(prev, cur);
+    const newLine  = prev && !adjacent;
 
-    const curX   = cur.transform[4];
-    const curY   = cur.transform[5];
-    const prevX  = prev.transform[4];
-    const prevY  = prev.transform[5];
-    const prevW  = prev.width ?? 0;
-    const prevR  = prevX + prevW;          // 前一 item 右边缘 x
-    const xGap   = curX - prevR;           // 当前 item 左边缘与前一 item 右边缘的间距
-    const sameY  = Math.abs(curY - prevY) < 1;
-
-    // ── 情况 A：同一行，x 坐标紧邻（间距极小）→ 直接拼接 ──────────────────
-    if (sameY && xGap <= X_GAP_THRESHOLD) {
-      result += str;
-      continue;
-    }
-
-    // ── 情况 B：跨行续接 URL ───────────────────────────────────────────────
-    // 条件：
-    //   - 前一行末尾看起来像 URL 片段（包含 http 或末尾是 URL 合法字符且无空格）
-    //   - 当前行首字符是 URL 合法字符（非空格、非大写开头的新词）
-    const prevTail = result.trimEnd();
-    const inUrl    = /https?:\/\/\S+$/.test(prevTail);  // result 末尾有未结束的 URL
-    const curHead  = str.trimStart()[0] ?? "";
-    const isUrlContinuation =
-      inUrl &&
-      /^[-a-zA-Z0-9@:%._+~#?&/=]/.test(curHead) &&  // 首字符合法
-      !/^[A-Z][a-z]/.test(str.trimStart());           // 排除"新句子"（首字母大写接小写）
-
-    if (isUrlContinuation) {
-      // 去掉前一行可能残留的断行连字符 "-"（PDF 常见断词符号）
-      if (result.endsWith("-")) {
-        result = result.slice(0, -1);
+    // ── 换行时：决定是否续接当前 buf ────────────────────────────────────────
+    if (newLine && buf !== null) {
+      // 情况1：末尾是 "-"（PDF 断词符），且当前行首是合法 URL 字符 → 去"-"后续接
+      if (/-$/.test(buf) && /^[-a-zA-Z0-9@:%._+~#?&/=]/.test(str) && !/^https?:\/\//i.test(str)) {
+        buf = buf.slice(0, -1);
+        // 继续往下处理（不 flush）
       }
-      result += str.trimStart();
-      continue;
+      // 情况2：末尾看起来不完整，且行首是合法 URL 字符，且不是新 URL → 续接
+      else if (!urlLooksComplete(buf) && /^[-a-zA-Z0-9@:%._+~#?&/=]/.test(str) && !/^https?:\/\//i.test(str)) {
+        // 续接，继续往下处理
+      }
+      // 情况3：其他 → flush，以新状态处理当前 item
+      else {
+        flush();
+      }
     }
 
-    // ── 默认：插入空格分隔 ────────────────────────────────────────────────
-    result += " " + str;
+    // ── 处理当前 item（可能含有 http 起始）──────────────────────────────────
+    const parts = splitAtHttpStarts(str);
+
+    for (const part of parts) {
+      if (part.isStart) {
+        // 遇到新的 URL 起始 → flush 旧的，开始新 URL
+        flush();
+        buf = part.text;
+      } else {
+        // 非 URL 起始的文本段
+        if (buf !== null) {
+          // 追加到当前 URL（可能是 URL 后面的后缀，也可能是下一 item 的续接）
+          buf += part.text;
+        }
+        // 如果不在 URL 中，忽略普通文本
+      }
+    }
   }
 
-  return result;
+  flush();
+  return found;
 }
 
 // ── Core: extract links using pdf.js loaded in popup context ─────────────────
@@ -128,48 +173,52 @@ async function extractLinks(pdfUrl) {
 
   for (let p = 1; p <= pdf.numPages; p++) {
     const page = await pdf.getPage(p);
+    const pageLinks = [];
 
     // ── 方式 1: 注解层超链接（最准确，优先处理）─────────────────────────────
     const annotations = await page.getAnnotations();
-    const annLinks = [];
     for (const ann of annotations) {
       const raw = (ann.url || ann.unsafeUrl || "").trim();
       if (raw && /^https?:\/\//i.test(raw)) {
         const key = `${raw}||${p}`;
         if (!seen.has(key)) {
           seen.add(key);
+          pageLinks.push(raw);
           links.push({ link: raw, pageNumber: p });
-          annLinks.push(raw);
         }
       }
     }
 
-    // ── 方式 2: 文本层正则扫描（智能拼接处理断行 URL）────────────────────────
+    // ── 方式 2: 文本层状态机扫描 ─────────────────────────────────────────────
     const textContent = await page.getTextContent();
-    const items = textContent.items.filter(i => i.str);
+    const items = textContent.items.filter(i => typeof i.str === "string");
 
-    // 智能拼接，处理 URL 断行
-    const text = buildSmartText(items);
+    // Debug：输出 items 原始内容
+    console.group(`Page ${p} — items[${items.length}]`);
+    items.forEach((it, idx) => {
+      const x = it.transform[4].toFixed(1);
+      const y = it.transform[5].toFixed(1);
+      const w = (it.width ?? 0).toFixed(1);
+      console.log(`  [${idx}] x=${x} y=${y} w=${w} | ${JSON.stringify(it.str)}`);
+    });
 
-    // Debug log：输出每页拼接后的原始文本
-    console.group(`Page ${p}`);
-    console.log("📝 拼接文本:\n" + text);
+    const urlsFromText = extractUrlsFromItems(items);
+    console.log("🔍 文本层提取 URLs:", urlsFromText);
 
-    const textLinks = [];
-    for (const m of text.matchAll(URL_REGEX)) {
-      // 去除末尾标点（但保留 URL 中合法的括号等）
-      let url = m[0].replace(/[.,;:!?)>»]+$/, "");
+    for (const url of urlsFromText) {
       const key = `${url}||${p}`;
       if (!seen.has(key)) {
         seen.add(key);
+        pageLinks.push(url);
         links.push({ link: url, pageNumber: p });
-        textLinks.push(url);
       }
     }
 
-    if (annLinks.length)  console.log("🔗 注解链接:", annLinks);
-    if (textLinks.length) console.log("🔍 文本链接:", textLinks);
-    if (!annLinks.length && !textLinks.length) console.log("— 无链接");
+    if (pageLinks.length) {
+      console.log("✅ 本页最终链接:", pageLinks);
+    } else {
+      console.log("— 无链接");
+    }
     console.groupEnd();
   }
 
