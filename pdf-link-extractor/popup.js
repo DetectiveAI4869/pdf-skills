@@ -31,17 +31,90 @@ function renderError(msg) {
   setContent(`<div class="error-box">⚠️ ${msg}</div>`);
 }
 
+// ── 智能文本拼接：处理 PDF 文本层 item 间的 URL 断行 ───────────────────────
+//
+// PDF 的 getTextContent() 返回若干 item，每个 item 有：
+//   - str      : 文字内容
+//   - transform: [scaleX, skewY, skewX, scaleY, x, y] 左下角坐标
+//   - width    : item 渲染宽度（字体单位）
+//   - hasEOL   : 是否行末
+//
+// 问题根源：长 URL 在 PDF 排版时被拆成多个连续 item（或跨行），
+// 简单 join(" ") 会把 URL 中间插入空格导致截断。
+//
+// 修复策略：判断相邻两个 item 是否"无缝衔接"，若是则直接拼接（不加空格）：
+//   1. 同一行（y 坐标相同），且前一 item 的右边缘 ≈ 当前 item 左边缘
+//   2. 当前行首 item 的内容像是上一行末 URL 的续接
+//      （上一行末尾不含空格结尾，且当前首字符是 URL 合法字符，非大写字母开头新词）
+//
+function buildSmartText(items) {
+  if (!items.length) return "";
+
+  // 容差：x 坐标差值在此范围内认为"紧邻"（字体单位，约 1-2 个字符宽）
+  const X_GAP_THRESHOLD = 2;
+
+  let result = "";
+
+  for (let i = 0; i < items.length; i++) {
+    const cur  = items[i];
+    const prev = items[i - 1];
+    const str  = cur.str;
+
+    if (i === 0) {
+      result += str;
+      continue;
+    }
+
+    const curX   = cur.transform[4];
+    const curY   = cur.transform[5];
+    const prevX  = prev.transform[4];
+    const prevY  = prev.transform[5];
+    const prevW  = prev.width ?? 0;
+    const prevR  = prevX + prevW;          // 前一 item 右边缘 x
+    const xGap   = curX - prevR;           // 当前 item 左边缘与前一 item 右边缘的间距
+    const sameY  = Math.abs(curY - prevY) < 1;
+
+    // ── 情况 A：同一行，x 坐标紧邻（间距极小）→ 直接拼接 ──────────────────
+    if (sameY && xGap <= X_GAP_THRESHOLD) {
+      result += str;
+      continue;
+    }
+
+    // ── 情况 B：跨行续接 URL ───────────────────────────────────────────────
+    // 条件：
+    //   - 前一行末尾看起来像 URL 片段（包含 http 或末尾是 URL 合法字符且无空格）
+    //   - 当前行首字符是 URL 合法字符（非空格、非大写开头的新词）
+    const prevTail = result.trimEnd();
+    const inUrl    = /https?:\/\/\S+$/.test(prevTail);  // result 末尾有未结束的 URL
+    const curHead  = str.trimStart()[0] ?? "";
+    const isUrlContinuation =
+      inUrl &&
+      /^[-a-zA-Z0-9@:%._+~#?&/=]/.test(curHead) &&  // 首字符合法
+      !/^[A-Z][a-z]/.test(str.trimStart());           // 排除"新句子"（首字母大写接小写）
+
+    if (isUrlContinuation) {
+      // 去掉前一行可能残留的断行连字符 "-"（PDF 常见断词符号）
+      if (result.endsWith("-")) {
+        result = result.slice(0, -1);
+      }
+      result += str.trimStart();
+      continue;
+    }
+
+    // ── 默认：插入空格分隔 ────────────────────────────────────────────────
+    result += " " + str;
+  }
+
+  return result;
+}
+
 // ── Core: extract links using pdf.js loaded in popup context ─────────────────
 async function extractLinks(pdfUrl) {
-  // pdfjsLib is available globally because popup.html loads lib/pdf.min.js
   const pdfjsLib = window.pdfjsLib;
   if (!pdfjsLib) throw new Error("pdf.js 未就绪，请确认 lib/pdf.min.js 已正确放置。");
 
-  // Point worker to the local copy inside the extension
   pdfjsLib.GlobalWorkerOptions.workerSrc = chrome.runtime.getURL("lib/pdf.worker.min.js");
 
-  // Fetch the PDF — popup has extension origin, so cross-origin PDFs may need CORS.
-  // For Chrome's built-in viewer the tab URL IS the raw PDF URL, fetch works fine.
   const resp = await fetch(pdfUrl);
   if (!resp.ok) throw new Error(`无法获取 PDF (HTTP ${resp.status})`);
   const data = await resp.arrayBuffer();
@@ -50,33 +123,59 @@ async function extractLinks(pdfUrl) {
   const links = [];
   const seen  = new Set();
 
+  console.group(`📄 PDF Link Extractor — ${pdfUrl}`);
+  console.log(`总页数: ${pdf.numPages}`);
+
   for (let p = 1; p <= pdf.numPages; p++) {
     const page = await pdf.getPage(p);
 
-    // ── 方式 1: 注解层超链接 ─────────────────────────────────────────────────
+    // ── 方式 1: 注解层超链接（最准确，优先处理）─────────────────────────────
     const annotations = await page.getAnnotations();
+    const annLinks = [];
     for (const ann of annotations) {
-      const raw = ann.url || ann.unsafeUrl || "";
-      const url = raw.trim();
-      const key = `${url}||${p}`;
-      if (url && /^https?:\/\//i.test(url) && !seen.has(key)) {
-        seen.add(key);
-        links.push({ link: url, pageNumber: p });
+      const raw = (ann.url || ann.unsafeUrl || "").trim();
+      if (raw && /^https?:\/\//i.test(raw)) {
+        const key = `${raw}||${p}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          links.push({ link: raw, pageNumber: p });
+          annLinks.push(raw);
+        }
       }
     }
 
-    // ── 方式 2: 文本层正则扫描 ───────────────────────────────────────────────
+    // ── 方式 2: 文本层正则扫描（智能拼接处理断行 URL）────────────────────────
     const textContent = await page.getTextContent();
-    const text = textContent.items.map(i => i.str).join(" ");
+    const items = textContent.items.filter(i => i.str);
+
+    // 智能拼接，处理 URL 断行
+    const text = buildSmartText(items);
+
+    // Debug log：输出每页拼接后的原始文本
+    console.group(`Page ${p}`);
+    console.log("📝 拼接文本:\n" + text);
+
+    const textLinks = [];
     for (const m of text.matchAll(URL_REGEX)) {
-      const url = m[0].replace(/[.,;:!?)>]+$/, "");
+      // 去除末尾标点（但保留 URL 中合法的括号等）
+      let url = m[0].replace(/[.,;:!?)>»]+$/, "");
       const key = `${url}||${p}`;
       if (!seen.has(key)) {
         seen.add(key);
         links.push({ link: url, pageNumber: p });
+        textLinks.push(url);
       }
     }
+
+    if (annLinks.length)  console.log("🔗 注解链接:", annLinks);
+    if (textLinks.length) console.log("🔍 文本链接:", textLinks);
+    if (!annLinks.length && !textLinks.length) console.log("— 无链接");
+    console.groupEnd();
   }
+
+  console.log("\n✅ 提取完成，共", links.length, "个链接");
+  console.log(JSON.stringify({ links }, null, 2));
+  console.groupEnd();
 
   return links;
 }
