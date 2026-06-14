@@ -28,78 +28,76 @@ function renderError(msg) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  URL 提取核心逻辑
+//  URL 提取核心 — 状态机 + 字符级边界检测
 //
-//  背景：pdf.js getTextContent() 返回 items 数组，每个 item 是一小段文字。
-//  长 URL 可能被切成多个相邻 item（同行）或跨行 item。
+//  PDF getTextContent() 的 items 特点：
+//    · 长 URL 被拆成多个相邻 item（同行紧邻 / 跨行续接）
+//    · URL 后面可能紧跟中文、括号等非 URL 字符，没有任何分隔
+//    · 同行多个独立 URL 之间可能只靠 x 坐标区分
 //
-//  旧方案（join(" ")）的问题：
-//    ① 同行紧邻 item 插入空格 → URL 被空格截断
-//    ② 跨行续接过于激进 → 多个独立 URL 被粘连
-//
-//  新方案：状态机，以"http(s)://"为 URL 开始标志，逐 item 追踪：
-//    - 遇到 http → 结束当前 URL，开始新 URL
-//    - 同行紧邻 → 直接追加（无空格）
-//    - 跨行且当前 URL 末尾"不完整" → 续接（去可能的断行连字符）
-//    - 跨行且当前 URL 末尾"完整"   → 结束当前 URL，忽略非 URL 行首内容
+//  解决策略：
+//    1. 以 "https?://" 为 URL 开始信号，遇到就 flush 旧 URL、开启新 URL
+//    2. 追加 item 字符时逐字符扫描——遇到首个非 URL 字符立即截断（不吞入）
+//    3. # fragment：只有 URL 里已含 ? 或路径深度 > 2 时才是合法 fragment，
+//       否则（如幻灯片编号 #5516348）截断
+//    4. 换行时：仅当 buf 末尾"不完整"（以 - 或非字母数字结尾）才续接下一行
 //
 // ════════════════════════════════════════════════════════════════════════════
 
-// 判断两个相邻 item 是否在同一行且 x 坐标紧邻
+// URL 合法字符（不含 #，# 单独处理）
+const URL_CHAR_RE = /[-a-zA-Z0-9@:%._+~?&/=]/;
+
 function isAdjacentSameLine(prev, cur, threshold = 2) {
   const sameY = Math.abs(cur.transform[5] - prev.transform[5]) < 1;
   const prevRight = prev.transform[4] + (prev.width ?? 0);
-  const xGap = cur.transform[4] - prevRight;
-  return sameY && xGap <= threshold;
+  return sameY && (cur.transform[4] - prevRight) <= threshold;
 }
 
-// 判断当前积累的 URL 末尾是否"看起来完整"（不像被截断）
-// 完整：末尾是字母/数字，且不以 "-" 结尾（连字符通常意味着断行截断）
 function urlLooksComplete(s) {
-  return /[a-zA-Z0-9]$/.test(s) && !/-$/.test(s);
+  // 末尾是字母/数字且不以 - 结尾 → 视为完整，不续接下一行
+  return /[a-zA-Z0-9]$/.test(s) && !s.endsWith("-");
 }
 
-// 把 item.str 按所有 http(s):// 位置切割成段
-// 返回：[{ isStart: bool, text: string }, ...]
-// 例："foo https://a.com bar https://b.com baz"
-//   → [{isStart:false,text:"foo "}, {isStart:true,text:"https://a.com bar "},
-//      {isStart:true,text:"https://b.com baz"}]
-// 注意：isStart=true 的 text 包含从 http 到下一个 http（或末尾）之间的所有内容
-function splitAtHttpStarts(str) {
-  const parts = [];
-  const re = /https?:\/\//gi;
-  const matches = [...str.matchAll(re)];
+// 从 str[offset] 开始逐字符追加合法 URL 字符到 buf。
+// 遇到新 https?:// 或非 URL 字符时停止。
+// 返回 { buf, stopIdx }：stopIdx=-1 表示消费完整个剩余字符串。
+function appendUrlChars(buf, str, offset) {
+  for (let i = offset; i < str.length; i++) {
+    const ch = str[i];
 
-  if (matches.length === 0) {
-    parts.push({ isStart: false, text: str });
-    return parts;
+    // 遇到新 URL 起始 → 停止（调用方负责 flush + 开新 URL）
+    if (/^https?:\/\//i.test(str.slice(i))) {
+      return { buf, stopIdx: i };
+    }
+
+    // # 号：判断是否是合法 fragment
+    if (ch === "#") {
+      const hasQuery  = buf.includes("?");
+      const slashCount = (buf.match(/\//g) || []).length;
+      // https:// 本身含 2 个斜杠；slashCount > 2 → 有路径层级
+      if (!hasQuery && slashCount <= 2) {
+        return { buf, stopIdx: i }; // 当做锚点/编号，截断
+      }
+    }
+
+    // 非法字符（中文、空格、括号等）→ 截断
+    if (!URL_CHAR_RE.test(ch) && ch !== "#") {
+      return { buf, stopIdx: i };
+    }
+
+    buf += ch;
   }
-
-  if (matches[0].index > 0) {
-    parts.push({ isStart: false, text: str.slice(0, matches[0].index) });
-  }
-
-  for (let i = 0; i < matches.length; i++) {
-    const start = matches[i].index;
-    const end   = i + 1 < matches.length ? matches[i + 1].index : str.length;
-    parts.push({ isStart: true, text: str.slice(start, end) });
-  }
-
-  return parts;
+  return { buf, stopIdx: -1 };
 }
 
-// 主函数：从 items 中提取所有 URL
 function extractUrlsFromItems(items) {
-  const found = [];   // 最终结果
-  let buf = null;     // 当前正在积累的 URL 字符串，null 表示不在 URL 中
+  const found = [];
+  let buf = null; // null = 不在 URL 中
 
   function flush() {
     if (buf !== null) {
-      // 去除末尾标点（保留字母/数字/斜杠结尾的部分）
       const cleaned = buf.replace(/[.,;:!?)>\]»]+$/, "");
-      if (/^https?:\/\/.{4,}/.test(cleaned)) {
-        found.push(cleaned);
-      }
+      if (/^https?:\/\/[^\s]{4,}/.test(cleaned)) found.push(cleaned);
       buf = null;
     }
   }
@@ -113,38 +111,42 @@ function extractUrlsFromItems(items) {
     const adjacent = prev && isAdjacentSameLine(prev, cur);
     const newLine  = prev && !adjacent;
 
-    // ── 换行时：决定是否续接当前 buf ────────────────────────────────────────
+    // ── 换行处理 ────────────────────────────────────────────────────────────
     if (newLine && buf !== null) {
-      // 情况1：末尾是 "-"（PDF 断词符），且当前行首是合法 URL 字符 → 去"-"后续接
-      if (/-$/.test(buf) && /^[-a-zA-Z0-9@:%._+~#?&/=]/.test(str) && !/^https?:\/\//i.test(str)) {
+      const firstCh = str[0] ?? "";
+      const isNewUrl = /^https?:\/\//i.test(str);
+
+      if (!isNewUrl && buf.endsWith("-") && URL_CHAR_RE.test(firstCh)) {
+        // PDF 断词连字符：去 "-" 续接
         buf = buf.slice(0, -1);
-        // 继续往下处理（不 flush）
-      }
-      // 情况2：末尾看起来不完整，且行首是合法 URL 字符，且不是新 URL → 续接
-      else if (!urlLooksComplete(buf) && /^[-a-zA-Z0-9@:%._+~#?&/=]/.test(str) && !/^https?:\/\//i.test(str)) {
-        // 续接，继续往下处理
-      }
-      // 情况3：其他 → flush，以新状态处理当前 item
-      else {
+      } else if (!isNewUrl && !urlLooksComplete(buf) && URL_CHAR_RE.test(firstCh)) {
+        // URL 末尾不完整：续接
+      } else {
+        // URL 完整 或 下一行是新 URL 或 非 URL 字符开头：flush
         flush();
       }
     }
 
-    // ── 处理当前 item（可能含有 http 起始）──────────────────────────────────
-    const parts = splitAtHttpStarts(str);
-
-    for (const part of parts) {
-      if (part.isStart) {
-        // 遇到新的 URL 起始 → flush 旧的，开始新 URL
+    // ── 逐字符处理当前 item ──────────────────────────────────────────────────
+    let offset = 0;
+    while (offset < str.length) {
+      if (/^https?:\/\//i.test(str.slice(offset))) {
+        // 新 URL 起始
         flush();
-        buf = part.text;
+        buf = "";
+        const r = appendUrlChars(buf, str, offset);
+        buf = r.buf;
+        if (r.stopIdx === -1) { offset = str.length; }
+        else { offset = r.stopIdx; flush(); }
+      } else if (buf !== null) {
+        // 在 URL 中，继续追加
+        const r = appendUrlChars(buf, str, offset);
+        buf = r.buf;
+        if (r.stopIdx === -1) { offset = str.length; }
+        else { offset = r.stopIdx; flush(); }
       } else {
-        // 非 URL 起始的文本段
-        if (buf !== null) {
-          // 追加到当前 URL（可能是 URL 后面的后缀，也可能是下一 item 的续接）
-          buf += part.text;
-        }
-        // 如果不在 URL 中，忽略普通文本
+        // 不在 URL 中，跳过
+        offset++;
       }
     }
   }
@@ -153,7 +155,7 @@ function extractUrlsFromItems(items) {
   return found;
 }
 
-// ── Core: extract links using pdf.js loaded in popup context ─────────────────
+// ── Core: extract links ───────────────────────────────────────────────────────
 async function extractLinks(pdfUrl) {
   const pdfjsLib = window.pdfjsLib;
   if (!pdfjsLib) throw new Error("pdf.js 未就绪，请确认 lib/pdf.min.js 已正确放置。");
@@ -168,68 +170,49 @@ async function extractLinks(pdfUrl) {
   const links = [];
   const seen  = new Set();
 
-  console.group(`📄 PDF Link Extractor — ${pdfUrl}`);
+  console.group(`PDF Link Extractor — ${pdfUrl}`);
   console.log(`总页数: ${pdf.numPages}`);
 
   for (let p = 1; p <= pdf.numPages; p++) {
     const page = await pdf.getPage(p);
     const pageLinks = [];
 
-    // ── 方式 1: 注解层超链接（最准确，优先处理）─────────────────────────────
+    // 方式 1：注解层（最准确）
     const annotations = await page.getAnnotations();
     for (const ann of annotations) {
       const raw = (ann.url || ann.unsafeUrl || "").trim();
       if (raw && /^https?:\/\//i.test(raw)) {
         const key = `${raw}||${p}`;
-        if (!seen.has(key)) {
-          seen.add(key);
-          pageLinks.push(raw);
-          links.push({ link: raw, pageNumber: p });
-        }
+        if (!seen.has(key)) { seen.add(key); pageLinks.push(raw); links.push({ link: raw, pageNumber: p }); }
       }
     }
 
-    // ── 方式 2: 文本层状态机扫描 ─────────────────────────────────────────────
+    // 方式 2：文本层状态机
     const textContent = await page.getTextContent();
-    const items = textContent.items.filter(i => typeof i.str === "string");
+    const items = textContent.items.filter(it => typeof it.str === "string");
 
-    // Debug：输出 items 原始内容
-    console.group(`Page ${p} — items[${items.length}]`);
+    console.group(`Page ${p} — ${items.length} items`);
     items.forEach((it, idx) => {
-      const x = it.transform[4].toFixed(1);
-      const y = it.transform[5].toFixed(1);
-      const w = (it.width ?? 0).toFixed(1);
-      console.log(`  [${idx}] x=${x} y=${y} w=${w} | ${JSON.stringify(it.str)}`);
+      const x = it.transform[4].toFixed(1), y = it.transform[5].toFixed(1), w = (it.width ?? 0).toFixed(1);
+      console.log(`[${idx}] x=${x} y=${y} w=${w} | ${JSON.stringify(it.str)}`);
     });
 
-    const urlsFromText = extractUrlsFromItems(items);
-    console.log("🔍 文本层提取 URLs:", urlsFromText);
-
-    for (const url of urlsFromText) {
+    for (const url of extractUrlsFromItems(items)) {
       const key = `${url}||${p}`;
-      if (!seen.has(key)) {
-        seen.add(key);
-        pageLinks.push(url);
-        links.push({ link: url, pageNumber: p });
-      }
+      if (!seen.has(key)) { seen.add(key); pageLinks.push(url); links.push({ link: url, pageNumber: p }); }
     }
 
-    if (pageLinks.length) {
-      console.log("✅ 本页最终链接:", pageLinks);
-    } else {
-      console.log("— 无链接");
-    }
+    console.log(pageLinks.length ? `Links: ${JSON.stringify(pageLinks)}` : "— 无链接");
     console.groupEnd();
   }
 
-  console.log("\n✅ 提取完成，共", links.length, "个链接");
+  console.log(`\n完成，共 ${links.length} 个链接`);
   console.log(JSON.stringify({ links }, null, 2));
   console.groupEnd();
-
   return links;
 }
 
-// ── Render ───────────────────────────────────────────────────────────────────
+// ── Render ────────────────────────────────────────────────────────────────────
 function renderLinks(filename, links) {
   if (links.length === 0) {
     setContent(`<div class="empty">📄 已扫描完毕<br>该 PDF 中未找到任何网页链接。</div>`);
@@ -274,8 +257,7 @@ function renderLinks(filename, links) {
       href: URL.createObjectURL(blob),
       download: `${filename.replace(/\.pdf$/i, "")}_links.json`
     });
-    a.click();
-    URL.revokeObjectURL(a.href);
+    a.click(); URL.revokeObjectURL(a.href);
   });
 
   document.querySelectorAll(".copy-one").forEach(btn => {
@@ -299,7 +281,6 @@ function renderLinks(filename, links) {
 // ── Entry point ───────────────────────────────────────────────────────────────
 (async () => {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-
   if (!tab?.url) { renderError("无法获取当前标签页信息。"); return; }
 
   if (!isPdfUrl(tab.url)) {
