@@ -1,22 +1,25 @@
 {
   "manifest_version": 3,
   "name": "PDF Link Extractor",
-  "version": "1.1.0",
-  "description": "Extract all web links from PDF files opened in Chrome",
+  "version": "2.0.0",
+  "description": "Extract all web links from PDF files opened in Chrome (Side Panel)",
   "permissions": [
-    "activeTab"
+    "tabs",
+    "sidePanel"
   ],
   "host_permissions": [
     "<all_urls>"
   ],
   "action": {
-    "default_popup": "popup.html",
     "default_icon": {
       "16": "icons/icon16.png",
       "48": "icons/icon48.png",
       "128": "icons/icon128.png"
     },
     "default_title": "PDF Link Extractor"
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
   },
   "background": {
     "service_worker": "background.js"
