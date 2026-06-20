@@ -24,12 +24,12 @@ function escHtml(str) {
             .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
 
-// ── PDF 解析（保留原版 concatTextContent）────────────────────────────────────
+// ── PDF 解析 ──────────────────────────────────────────────────────────────────
 function concatTextContent(items) {
-  const pageLinks = [];
+  const pageLinks = [];            // const: 数组引用不变，push 内容
   let i = 0;
-  const urlHeadRegex = /^https?:\/\//;
-  const urlInvalidCharRegex = /[^A-Za-z0-9\-._~:/?#[\]@!$&'*+,;=]/;
+  const urlHeadRegex        = /^https?:\/\//;                          // TODO: 支持 www. 开头
+  const urlInvalidCharRegex = /[^A-Za-z0-9\-._~:/?#[\]@!$&'*+,;=]/; // TODO: 支持 () 字符
 
   while (i < items.length) {
     if (urlHeadRegex.test(items[i].str)) {
@@ -56,6 +56,25 @@ function concatTextContent(items) {
   return pageLinks;
 }
 
+// ── Debug helpers ─────────────────────────────────────────────────────────────
+// 设置 debugPages 中的页码以输出该页 items 详情，空数组 = 不输出
+// 例：const debugPages = [6, 10, 19];
+const debugPages = [];
+
+function debugPageItems(p, items) {
+  if (!debugPages.includes(p)) return;
+  console.group(`Page ${p} — items[${items.length}]`);
+  console.dir(items);
+  items.forEach((item, i) => {
+    const x = item.transform[4].toFixed(1);
+    const y = item.transform[5].toFixed(1);
+    const w = item.width.toFixed(1);
+    console.log(`  [${i}] x=${x} y=${y} w=${w} | ${JSON.stringify(item.str)} | ${item.fontName}`);
+  });
+  console.groupEnd();
+}
+
+// ── 核心提取 ─────────────────────────────────────────────────────────────────
 async function extractLinks(pdfUrl) {
   const pdfjsLib = window.pdfjsLib;
   if (!pdfjsLib) throw new Error("pdf.js 未就绪，请确认 lib/pdf.min.js 已正确放置。");
@@ -70,45 +89,46 @@ async function extractLinks(pdfUrl) {
   const links = [];
   const seen  = new Set();
 
+  console.log(`PDF Link Extractor — ${pdfUrl}`);
+  console.log(`总页数: ${pdf.numPages}`);
+
   for (let p = 1; p <= pdf.numPages; p++) {
     const page = await pdf.getPage(p);
 
-    // 方式 1：注解层
+    // 方式 1：注解层（最准确，优先）
     const annotations = await page.getAnnotations();
     for (const ann of annotations) {
       const raw = (ann.url || ann.unsafeUrl || "").trim();
       if (raw && /^https?:\/\//i.test(raw)) {
         const key = `${raw}||${p}`;
-        if (!seen.has(key)) {
-          seen.add(key);
-          links.push({ link: raw, pageNumber: p });
-        }
+        if (!seen.has(key)) { seen.add(key); links.push({ link: raw, pageNumber: p }); }
       }
     }
 
     // 方式 2：文本层
     const textContent = await page.getTextContent();
     const items = textContent.items.filter(it => typeof it.str === "string");
+
+    debugPageItems(p, items);
+
     for (const url of concatTextContent(items)) {
       const key = `${url}||${p}`;
-      if (!seen.has(key)) {
-        seen.add(key);
-        links.push({ link: url, pageNumber: p });
-      }
+      if (!seen.has(key)) { seen.add(key); links.push({ link: url, pageNumber: p }); }
     }
   }
+
+  console.log(`总链接数: ${links.length}`);
+  console.log(JSON.stringify({ links }, null, 2));
 
   return links;
 }
 
 // ── 渲染 ──────────────────────────────────────────────────────────────────────
-function setHeaderSub(text) {
-  $("header-sub").textContent = text;
-}
+function setHeaderSub(text) { $("header-sub").textContent = text; }
 
 function setContent(html) {
   $("content").innerHTML = html;
-  // 重新绑定 filter-input（如果存在）
+
   const fi = $("filter-input");
   if (fi) {
     fi.addEventListener("input", e => {
@@ -118,7 +138,7 @@ function setContent(html) {
       });
     });
   }
-  // 重新绑定 copy-one
+
   document.querySelectorAll(".copy-one").forEach(btn => {
     btn.addEventListener("click", e => {
       e.stopPropagation();
@@ -186,7 +206,6 @@ function showLinks(filename, links) {
     <div id="link-list">${listItems}</div>
   `);
 
-  // 复制 JSON
   $("btn-copy").addEventListener("click", () => {
     navigator.clipboard.writeText(resultJson).then(() => {
       const b = $("btn-copy");
@@ -198,65 +217,52 @@ function showLinks(filename, links) {
 }
 
 // ── 标签页切换响应 ────────────────────────────────────────────────────────────
-// 用 URL 做缓存 key，避免同一 PDF 重复解析
-const cache = new Map(); // url → links[]
+const cache    = new Map(); // url → links[]（同一 PDF 只解析一次）
 let currentUrl = null;
-let parsing = false;
+let parsing    = false;
 
 async function handleTab(tab) {
   const url = tab?.url;
-
-  // 同一个 URL 无需重复处理
-  if (url === currentUrl) return;
+  if (url === currentUrl) return;   // 同 URL 无需重复处理
   currentUrl = url;
 
-  if (!isPdfUrl(url)) {
-    showIdle();
-    return;
-  }
+  if (!isPdfUrl(url)) { showIdle(); return; }
 
   const filename = getFilename(url);
 
-  // 命中缓存
-  if (cache.has(url)) {
-    showLinks(filename, cache.get(url));
-    return;
-  }
+  if (cache.has(url)) { showLinks(filename, cache.get(url)); return; }
 
-  // 防止并发解析
-  if (parsing) return;
+  if (parsing) return;   // 已有解析任务进行中
   parsing = true;
   showLoading(filename);
 
   try {
     const links = await extractLinks(url);
     cache.set(url, links);
-    // 确保还是同一个 tab（期间用户可能切走了）
-    if (currentUrl === url) {
-      showLinks(filename, links);
-    }
+    if (currentUrl === url) showLinks(filename, links);
   } catch (err) {
     console.error(err);
-    if (currentUrl === url) {
-      showError(filename, err.message);
-    }
+    if (currentUrl === url) showError(filename, err.message);
   } finally {
     parsing = false;
   }
 }
 
-// ── 监听 background 发来的标签页变化通知 ─────────────────────────────────────
+// ── 监听 background 的标签页变化通知 ─────────────────────────────────────────
 chrome.runtime.onMessage.addListener((message) => {
-  if (message.type === "TAB_CHANGED") {
-    handleTab(message.tab);
-  }
+  if (message?.type === "TAB_CHANGED") handleTab(message.tab);
 });
 
-// ── 初始化：sidePanel 打开时，主动查询当前激活标签页 ─────────────────────────
+// ── 初始化：sidePanel 打开时主动查询当前激活标签页 ───────────────────────────
+//
+// 注意：sidePanel 实例是绑定到具体 windowId 的，但页面脚本本身不知道自己
+// 属于哪个窗口（chrome.windows.getCurrent 在 sidePanel 上下文中也不可靠）。
+// 因此改为：向 background 请求"这个 sidePanel 所在窗口的当前激活标签页"，
+// background 通过 sender.tab / sender 的窗口信息来确定。
 (async () => {
   try {
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    await handleTab(tab);
+    const response = await chrome.runtime.sendMessage({ type: "GET_INIT_TAB" });
+    await handleTab(response?.tab);
   } catch (err) {
     console.error(err);
     showIdle();

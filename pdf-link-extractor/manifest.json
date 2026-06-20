@@ -18,9 +18,6 @@
     },
     "default_title": "PDF Link Extractor"
   },
-  "side_panel": {
-    "default_path": "sidepanel.html"
-  },
   "background": {
     "service_worker": "background.js"
   },
