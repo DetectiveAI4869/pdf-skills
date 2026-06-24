@@ -28,13 +28,13 @@ function escHtml(str) {
 function concatTextContent(items) {
   const pageLinks = [];            // const: 数组引用不变，push 内容
   let i = 0;
-  const urlHeadRegex        = /^https?:\/\//;                          // TODO: 支持 www. 开头
+  const urlHeadRegex        = /https?:\/\//;                          // TODO: 支持 www. 开头
   const urlInvalidCharRegex = /[^A-Za-z0-9\-._~:/?#[\]@!$&'*+,;=]/; // TODO: 支持 () 字符
 
   while (i < items.length) {
     if (urlHeadRegex.test(items[i].str)) {
       const head = items[i];
-      let link = head.str;
+      let link = head.str.substring(head.str.indexOf("http"));
       let j = i + 1;
 
       while (j < items.length) {
@@ -101,6 +101,7 @@ async function extractLinks(pdfUrl) {
       const raw = (ann.url || ann.unsafeUrl || "").trim();
       if (raw && /^https?:\/\//i.test(raw)) {
         const key = `${raw}||${p}`;
+        console.log(`Annotations: ${key}`);
         if (!seen.has(key)) { seen.add(key); links.push({ link: raw, pageNumber: p }); }
       }
     }
@@ -113,6 +114,7 @@ async function extractLinks(pdfUrl) {
 
     for (const url of concatTextContent(items)) {
       const key = `${url}||${p}`;
+      console.log(`TextContent: ${key}`);
       if (!seen.has(key)) { seen.add(key); links.push({ link: url, pageNumber: p }); }
     }
   }
